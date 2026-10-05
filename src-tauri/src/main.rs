@@ -2,7 +2,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use parking_lot::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tauri::{
@@ -24,6 +24,9 @@ use win11_clipboard_history_lib::session::is_wayland;
 use win11_clipboard_history_lib::shortcut_setup;
 use win11_clipboard_history_lib::theme_manager::{self, ThemeInfo};
 use win11_clipboard_history_lib::user_settings::{UserSettings, UserSettingsManager};
+
+mod window_interaction;
+use window_interaction::NativeWindowInteraction;
 
 /// Global flag to track if we started in background mode
 /// This is used to block the initial window show
@@ -122,6 +125,11 @@ fn is_settings_window_visible(app: AppHandle) -> bool {
     app.get_webview_window("settings")
         .map(|w| w.is_visible().unwrap_or(false))
         .unwrap_or(false)
+}
+
+#[tauri::command]
+fn open_settings(app: AppHandle) {
+    SettingsController::show(&app);
 }
 
 // --- Theme Detection Commands ---
@@ -709,6 +717,124 @@ impl SettingsController {
 
 // --- Window Event Helper ---
 
+/// Native border resizing temporarily gives focus to the compositor. Register
+/// on GTK itself: these presses do not reliably reach the React webview.
+fn install_resize_focus_guard(
+    window: &WebviewWindow,
+    resize_focus_loss: Arc<NativeWindowInteraction>,
+    focus_generation: Arc<AtomicU64>,
+) {
+    use gtk::prelude::*;
+
+    if let Ok(native_window) = window.gtk_window() {
+        let interaction_on_hide = resize_focus_loss.clone();
+        native_window.connect_hide(move |_| {
+            interaction_on_hide.reset();
+        });
+        // A normal button-press signal runs during bubbling and can be consumed
+        // by GTK's resize handling before our callback receives it. Observe the
+        // press during capture without claiming or blocking the gesture.
+        let press = gtk::GestureMultiPress::new(&native_window);
+        press.set_button(1);
+        press.set_propagation_phase(gtk::PropagationPhase::Capture);
+        let native_weak = native_window.downgrade();
+        let interaction_on_release = resize_focus_loss.clone();
+        press.connect_pressed(move |_, _, x, y| {
+            let Some(native) = native_weak.upgrade() else {
+                return;
+            };
+            if native.is_resizable() && !native.is_maximized() {
+                // Gesture coordinates are local to the native window, avoiding
+                // global screen-coordinate assumptions on Wayland.
+                let (width, height) = native.size();
+                let border = f64::from(native.scale_factor() * 5);
+                let within_window = x >= -border
+                    && y >= -border
+                    && x <= f64::from(width) + border
+                    && y <= f64::from(height) + border;
+                let on_border = x <= border
+                    || y <= border
+                    || x >= f64::from(width) - border
+                    || y >= f64::from(height) - border;
+                // The top grip is draggable from the React header. GTK moves
+                // the whole native window from this area, so it needs the same
+                // protection as a border resize.
+                let on_drag_handle = within_window && (0.0..=24.0).contains(&y);
+                let protect_focus_loss = within_window && (on_border || on_drag_handle);
+                resize_focus_loss.begin(protect_focus_loss);
+            }
+        });
+        let native_weak = native_window.downgrade();
+        let window_on_release = window.clone();
+        press.connect_released(move |_, _, x, y| {
+            interaction_on_release.release();
+            if interaction_on_release.is_protected()
+                || !window_on_release.is_visible().unwrap_or(false)
+            {
+                return;
+            }
+            let Some(native) = native_weak.upgrade() else {
+                return;
+            };
+            let (width, height) = native.size();
+            if x >= 0.0 && y >= 0.0 && x < f64::from(width) && y < f64::from(height) {
+                // A held click inside must not be mistaken for an outside
+                // click, even when GTK temporarily loses keyboard focus.
+                if !native.is_active() {
+                    let _ = window_on_release.set_focus();
+                }
+            } else {
+                schedule_hide_after_focus_loss(
+                    window_on_release.clone(),
+                    focus_generation.clone(),
+                    interaction_on_release.clone(),
+                    focus_generation.load(Ordering::SeqCst),
+                );
+            }
+        });
+        // Retain the controller for the native window's lifetime.
+        native_window.connect_destroy(move |_| press.reset());
+    }
+}
+
+/// GTK focus-out events can occur during native resizing or internal focus
+/// changes. Confirm that the top-level window really became inactive after
+/// those events settle, rather than treating every event as an outside click.
+fn schedule_hide_after_focus_loss(
+    window: WebviewWindow,
+    focus_generation: Arc<AtomicU64>,
+    resize_focus_loss: Arc<NativeWindowInteraction>,
+    generation: u64,
+) {
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        let window_for_check = window.clone();
+        let _ = window.run_on_main_thread(move || {
+            if focus_generation.load(Ordering::SeqCst) != generation
+                || resize_focus_loss.focus_lost()
+                || !window_for_check.is_visible().unwrap_or(false)
+                // On Linux this queries GTK's top-level is_active property,
+                // rather than relying on the earlier focus-out notification.
+                || window_for_check.is_focused().unwrap_or(true)
+            {
+                return;
+            }
+
+            let app = window_for_check.app_handle();
+            // Preserve the popup while Settings provides a live preview.
+            if app
+                .get_webview_window("settings")
+                .is_some_and(|settings| settings.is_visible().unwrap_or(false))
+            {
+                return;
+            }
+
+            WindowController::hide(app);
+        });
+    });
+}
+
 fn handle_window_moved_for_wayland(
     window: &WebviewWindow,
     state: &State<AppState>,
@@ -999,12 +1125,21 @@ fn main() {
             // Window Event Handlers (Focus & Move)
             let main_window = app.get_webview_window("main").unwrap();
             let w_clone = main_window.clone();
-            let app_handle_for_event = app_handle.clone();
+            let focus_generation = Arc::new(AtomicU64::new(0));
+            let resize_focus_loss = Arc::new(NativeWindowInteraction::default());
+            install_resize_focus_guard(
+                &main_window,
+                resize_focus_loss.clone(),
+                focus_generation.clone(),
+            );
 
             main_window.on_window_event(move |event| match event {
                 // Block any window show attempts when started in background mode
                 // This catches cases where GTK/Tauri automatically shows the window
                 WindowEvent::Focused(true) => {
+                    resize_focus_loss.focus_gained();
+                    // Cancel dismissal queued for an earlier focus loss.
+                    focus_generation.fetch_add(1, Ordering::SeqCst);
                     // Load both flags atomically with SeqCst to avoid race conditions
                     let started_in_background = STARTED_IN_BACKGROUND.load(Ordering::SeqCst);
                     let initial_show_allowed = INITIAL_SHOW_ALLOWED.load(Ordering::SeqCst);
@@ -1017,23 +1152,20 @@ fn main() {
                     }
                 }
                 WindowEvent::Focused(false) => {
-                    // Keep the popup available for settings live preview.
-                    if let Some(settings_window) =
-                        app_handle_for_event.get_webview_window("settings")
-                    {
-                        if settings_window.is_visible().unwrap_or(false) {
-                            return;
-                        }
+                    let generation = focus_generation.fetch_add(1, Ordering::SeqCst) + 1;
+                    // Retain the interaction marker: GTK may report focus loss
+                    // before the captured press reaches this event handler.
+                    // Focused(true) clears it when the compositor returns focus.
+                    if resize_focus_loss.focus_lost() {
+                        println!("[WindowController] Ignoring focus loss during resize/move");
+                        return;
                     }
-
-                    // A focus loss is the reliable signal for an outside click.
-                    // Don't gate this on pointer state: on Wayland the focus
-                    // event may arrive before the webview's mouse-leave event.
-                    let state = w_clone.state::<AppState>();
-                    if is_wayland() {
-                        state.config_manager.lock().sync_to_disk();
-                    }
-                    let _ = w_clone.hide();
+                    schedule_hide_after_focus_loss(
+                        w_clone.clone(),
+                        focus_generation.clone(),
+                        resize_focus_loss.clone(),
+                        generation,
+                    );
                 }
 
                 WindowEvent::Moved(pos) => {
@@ -1123,6 +1255,7 @@ fn main() {
             get_user_settings,
             set_user_settings,
             is_settings_window_visible,
+            open_settings,
             copy_text_to_clipboard,
             get_system_theme,
             refresh_system_theme,
