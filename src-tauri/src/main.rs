@@ -39,7 +39,6 @@ pub struct AppState {
     clipboard_manager: Arc<Mutex<ClipboardManager>>,
     emoji_manager: Arc<Mutex<EmojiManager>>,
     config_manager: Arc<Mutex<ConfigManager>>,
-    is_mouse_inside: Arc<AtomicBool>,
     /// Serializes the complete clipboard/focus/input transaction. Locking only
     /// the virtual device still allows two commands to swap clipboard content
     /// before either chord is emitted.
@@ -75,11 +74,6 @@ fn toggle_pin(state: State<AppState>, id: String) -> Option<ClipboardItem> {
 #[tauri::command]
 fn get_recent_emojis(state: State<AppState>) -> Vec<EmojiUsage> {
     state.emoji_manager.lock().get_recent()
-}
-
-#[tauri::command]
-fn set_mouse_state(state: State<AppState>, inside: bool) {
-    state.is_mouse_inside.store(inside, Ordering::Relaxed);
 }
 
 // --- User Settings Commands ---
@@ -152,7 +146,12 @@ fn is_theme_listener_active() -> bool {
 }
 
 #[tauri::command]
-async fn paste_item(app: AppHandle, state: State<'_, AppState>, id: String) -> Result<(), String> {
+async fn paste_item(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    id: String,
+    keep_open: Option<bool>,
+) -> Result<(), String> {
     let _paste_guard = state.paste_gate.lock().await;
 
     // 1. Get Item (Scope lock tightly)
@@ -175,6 +174,9 @@ async fn paste_item(app: AppHandle, state: State<'_, AppState>, id: String) -> R
             let history = manager.get_history();
             drop(manager); // Release lock before emitting
             let _ = app.emit("history-sync", &history);
+            if keep_open.unwrap_or(false) {
+                WindowController::show_after_selection(&app);
+            }
         }
         None => {
             eprintln!(
@@ -196,6 +198,7 @@ async fn paste_text(
     state: State<'_, AppState>,
     text: String,
     item_type: Option<String>,
+    keep_open: Option<bool>,
 ) -> Result<(), String> {
     let _paste_guard = state.paste_gate.lock().await;
 
@@ -219,6 +222,10 @@ async fn paste_text(
 
     // 3. Simulate Paste
     simulate_paste_keystroke().map_err(|e| e.to_string())?;
+
+    if keep_open.unwrap_or(false) {
+        WindowController::show_after_selection(&app);
+    }
 
     Ok(())
 }
@@ -439,6 +446,35 @@ impl WindowController {
             }
             let _ = window.hide();
         }
+    }
+
+    /// Return the clipboard popup after pasting the selected item into the
+    /// previously focused application.
+    fn show_after_selection(app: &AppHandle) {
+        let Some(window) = app.get_webview_window("main") else {
+            return;
+        };
+
+        if is_wayland() {
+            let _ = window.show();
+            let _ = window.set_always_on_top(true);
+            let _ = window.set_focus();
+
+            let window_clone = window.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(120));
+                let _ = window_clone.set_always_on_top(false);
+                let _ = window_clone.set_focus();
+            });
+        } else {
+            let _ = window.show();
+            if let Err(error) = x11_robust_activate("Clipboard History") {
+                eprintln!("[WindowController] X11 reactivation failed: {}", error);
+                let _ = Self::x11_activate_window_xdotool();
+            }
+        }
+
+        let _ = app.emit("window-shown", ());
     }
 
     fn position_and_show(window: &WebviewWindow, app: &AppHandle) {
@@ -808,7 +844,6 @@ fn main() {
 
     win11_clipboard_history_lib::session::init();
 
-    let is_mouse_inside = Arc::new(AtomicBool::new(false));
     let base_dir = dirs::data_local_dir()
         .unwrap_or_else(|| std::path::PathBuf::from("."))
         .join("win11-clipboard-history");
@@ -858,7 +893,6 @@ fn main() {
             clipboard_manager: clipboard_manager.clone(),
             emoji_manager: emoji_manager.clone(),
             config_manager: config_manager.clone(),
-            is_mouse_inside: is_mouse_inside.clone(),
             paste_gate: tokio::sync::Mutex::new(()),
         })
         .on_window_event(|window, event| {
@@ -981,12 +1015,7 @@ fn main() {
                     }
                 }
                 WindowEvent::Focused(false) => {
-                    let state = w_clone.state::<AppState>();
-                    if state.is_mouse_inside.load(Ordering::Relaxed) {
-                        return;
-                    }
-
-                    // Don't hide if settings window is visible (for live preview)
+                    // Keep the popup available for settings live preview.
                     if let Some(settings_window) =
                         app_handle_for_event.get_webview_window("settings")
                     {
@@ -995,10 +1024,13 @@ fn main() {
                         }
                     }
 
+                    // A focus loss is the reliable signal for an outside click.
+                    // Don't gate this on pointer state: on Wayland the focus
+                    // event may arrive before the webview's mouse-leave event.
+                    let state = w_clone.state::<AppState>();
                     if is_wayland() {
                         state.config_manager.lock().sync_to_disk();
                     }
-
                     let _ = w_clone.hide();
                 }
 
@@ -1086,7 +1118,6 @@ fn main() {
             paste_gif_from_url,
             finish_paste,
             finish_setup, // Register the new command
-            set_mouse_state,
             get_user_settings,
             set_user_settings,
             is_settings_window_visible,

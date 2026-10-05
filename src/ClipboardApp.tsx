@@ -227,14 +227,6 @@ function ClipboardApp() {
     setActiveTab(tab)
   }, [])
 
-  const handleMouseEnter = () => {
-    invoke('set_mouse_state', { inside: true }).catch(console.error)
-  }
-
-  const handleMouseLeave = () => {
-    invoke('set_mouse_state', { inside: false }).catch(console.error)
-  }
-
   // Render content based on active tab
   const renderContent = () => {
     switch (activeTab) {
@@ -292,8 +284,6 @@ function ClipboardApp() {
         isDark ? 'bg-win11-acrylic-bg' : 'bg-win11Light-acrylic-bg',
         isDark ? 'text-win11-text-primary' : 'text-win11Light-text-primary'
       )}
-      onMouseEnter={handleMouseEnter}
-      onMouseLeave={handleMouseLeave}
     >
       {/* Drag Handle */}
       <DragHandle isDark={isDark} />
