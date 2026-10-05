@@ -174,7 +174,9 @@ async fn paste_item(
             let history = manager.get_history();
             drop(manager); // Release lock before emitting
             let _ = app.emit("history-sync", &history);
-            if keep_open.unwrap_or(false) {
+            if keep_open.unwrap_or(false)
+                && UserSettingsManager::new().load().reopen_after_paste
+            {
                 WindowController::show_after_selection(&app);
             }
         }
@@ -223,7 +225,7 @@ async fn paste_text(
     // 3. Simulate Paste
     simulate_paste_keystroke().map_err(|e| e.to_string())?;
 
-    if keep_open.unwrap_or(false) {
+    if keep_open.unwrap_or(false) && UserSettingsManager::new().load().reopen_after_paste {
         WindowController::show_after_selection(&app);
     }
 

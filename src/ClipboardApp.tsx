@@ -23,6 +23,7 @@ const DEFAULT_SETTINGS: UserSettings = {
   enable_smart_actions: true,
   enable_ui_polish: true,
   enable_dynamic_tray_icon: true,
+  reopen_after_paste: true,
   max_history_size: 50,
   auto_delete_interval: 0,
   auto_delete_unit: 'hours',

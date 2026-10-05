@@ -13,6 +13,11 @@ const FEATURES = [
     label: 'UI Polish',
     desc: 'Enable animations and compact mode support.',
   },
+  {
+    key: 'reopen_after_paste',
+    label: 'Reopen Clipboard After Pasting',
+    desc: 'When off, the clipboard stays hidden after sending a selection to another app.',
+  },
 ] as const
 
 export function FeaturesSection({
