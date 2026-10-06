@@ -15,7 +15,6 @@ use win11_clipboard_history_lib::autostart_manager;
 use win11_clipboard_history_lib::clipboard_manager::{ClipboardItem, ClipboardManager};
 use win11_clipboard_history_lib::config_manager::{resolve_window_position, ConfigManager};
 use win11_clipboard_history_lib::emoji_manager::{EmojiManager, EmojiUsage};
-use win11_clipboard_history_lib::focus_manager::x11_robust_activate;
 use win11_clipboard_history_lib::focus_manager::{restore_focused_window, save_focused_window};
 use win11_clipboard_history_lib::input_simulator::simulate_paste_keystroke;
 use win11_clipboard_history_lib::permission_checker;
@@ -25,7 +24,9 @@ use win11_clipboard_history_lib::shortcut_setup;
 use win11_clipboard_history_lib::theme_manager::{self, ThemeInfo};
 use win11_clipboard_history_lib::user_settings::{UserSettings, UserSettingsManager};
 
+mod popup_activation;
 mod window_interaction;
+use popup_activation::PopupActivation;
 use window_interaction::NativeWindowInteraction;
 
 /// Global flag to track if we started in background mode
@@ -396,6 +397,8 @@ impl PasteHelper {
 
 // --- Window Controller (Visibility & Positioning) ---
 
+static POPUP_ACTIVATION: PopupActivation = PopupActivation::new();
+
 struct WindowController;
 
 impl WindowController {
@@ -419,7 +422,7 @@ impl WindowController {
                 if let Some(tab_name) = tab {
                     let _ = app.emit("switch-tab", tab_name);
                 } else {
-                    let _ = window.hide();
+                    Self::hide(app);
                 }
             } else {
                 save_focused_window();
@@ -447,12 +450,18 @@ impl WindowController {
     }
 
     pub fn hide(app: &AppHandle) {
+        POPUP_ACTIVATION.invalidate();
         if let Some(window) = app.get_webview_window("main") {
             // FLUSH CONFIG TO DISK ON HIDE
             if let Some(state) = app.try_state::<AppState>() {
                 if is_wayland() {
                     state.config_manager.lock().sync_to_disk();
                 }
+            }
+            // Clear a temporary Wayland activation hint even when its delayed
+            // cleanup was cancelled by this hide.
+            if cfg!(target_os = "linux") && is_wayland() {
+                let _ = window.set_always_on_top(false);
             }
             let _ = window.hide();
         }
@@ -461,98 +470,60 @@ impl WindowController {
     /// Return the clipboard popup after pasting the selected item into the
     /// previously focused application.
     fn show_after_selection(app: &AppHandle) {
-        let Some(window) = app.get_webview_window("main") else {
-            return;
-        };
-
-        if is_wayland() {
-            let _ = window.show();
-            let _ = window.set_always_on_top(true);
-            let _ = window.set_focus();
-
-            let window_clone = window.clone();
-            std::thread::spawn(move || {
-                std::thread::sleep(std::time::Duration::from_millis(120));
-                let _ = window_clone.set_always_on_top(false);
-                let _ = window_clone.set_focus();
-            });
-        } else {
-            let _ = window.show();
-            if let Err(error) = x11_robust_activate("Clipboard History") {
-                eprintln!("[WindowController] X11 reactivation failed: {}", error);
-                let _ = Self::x11_activate_window_xdotool();
-            }
+        if let Some(window) = app.get_webview_window("main") {
+            Self::show_and_activate(&window, app, false);
         }
-
-        let _ = app.emit("window-shown", ());
     }
 
     fn position_and_show(window: &WebviewWindow, app: &AppHandle) {
-        let state = app.state::<AppState>();
-
-        if is_wayland() {
-            Self::position_for_wayland(window, &state);
-        } else {
-            Self::position_for_non_wayland(window);
-        }
-
-        let is_wayland_session = is_wayland();
-
-        if is_wayland_session {
-            // Wayland needs to be born "On Top" to be visible
-            let _ = window.show();
-            let _ = window.set_always_on_top(true);
-            let _ = window.set_focus();
-        } else {
-            // X11 born as normal window.
-            // We do NOT activate always_on_top to avoid focus blocking and glitch.
-            let _ = window.show();
-        }
-
-        let window_clone = window.clone();
-        let app_clone = app.clone();
-
-        std::thread::spawn(move || {
-            // For Wayland, we still need a small delay for the compositor
-            // For X11, we use polling-based wait instead of fixed sleep
-            if is_wayland_session {
-                std::thread::sleep(std::time::Duration::from_millis(100));
-                let _ = window_clone.set_always_on_top(false);
-                let _ = window_clone.set_focus();
-            } else {
-                // Use EWMH _NET_ACTIVE_WINDOW protocol with polling instead of fixed sleep.
-                // This waits for the window to actually appear in X11's client list
-                // before attempting activation, solving the race condition.
-                if let Err(e) = x11_robust_activate("Clipboard History") {
-                    eprintln!("[WindowController] X11 activation failed: {}", e);
-                    // Fallback: try xdotool as last resort
-                    let _ = Self::x11_activate_window_xdotool();
-                }
-            }
-
-            let _ = app_clone.emit("window-shown", ());
-        });
+        Self::show_and_activate(window, app, true);
     }
 
-    /// Activate window on X11 using xdotool (fallback method)
-    fn x11_activate_window_xdotool() -> Result<(), String> {
-        use std::process::Command;
+    fn show_and_activate(window: &WebviewWindow, app: &AppHandle, position: bool) {
+        let generation = POPUP_ACTIVATION.invalidate();
+        let window_for_show = window.clone();
+        let app = app.clone();
+        // Check cancellation and apply window changes together on the UI thread.
+        // A delayed worker must not queue focus changes for an older invocation.
+        let _ = window.run_on_main_thread(move || {
+            if !POPUP_ACTIVATION.is_current(generation) {
+                return;
+            }
+            let window = window_for_show;
+            let wayland = cfg!(target_os = "linux") && is_wayland();
+            if position {
+                if wayland {
+                    Self::position_for_wayland(&window, &app.state::<AppState>());
+                } else {
+                    Self::position_for_non_wayland(&window);
+                }
+            }
+            let _ = window.show();
+            if wayland {
+                let _ = window.set_always_on_top(true);
+            }
+            // Use the native Tauri activation API on Windows/macOS as well as
+            // Linux; an unknown/non-Wayland session is not necessarily X11.
+            let _ = window.set_focus();
+            let _ = app.emit("window-shown", ());
 
-        let output = Command::new("xdotool")
-            .args(["search", "--name", "Clipboard History"])
-            .output()
-            .map_err(|e| format!("xdotool search failed: {}", e))?;
-
-        let window_ids = String::from_utf8_lossy(&output.stdout);
-        if let Some(window_id) = window_ids.lines().next() {
-            Command::new("xdotool")
-                .args(["windowactivate", "--sync", window_id])
-                .output()
-                .map_err(|e| format!("windowactivate failed: {}", e))?;
-            Ok(())
-        } else {
-            Err("Window not found".to_string())
-        }
+            if wayland {
+                tauri::async_runtime::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(120)).await;
+                    let window_for_check = window.clone();
+                    let _ = window.run_on_main_thread(move || {
+                        if !POPUP_ACTIVATION.is_current(generation)
+                            || !window_for_check.is_visible().unwrap_or(false)
+                        {
+                            return;
+                        }
+                        // Only remove the temporary hint. Never refocus after
+                        // a delay: the user may already be switching apps.
+                        let _ = window_for_check.set_always_on_top(false);
+                    });
+                });
+            }
+        });
     }
 
     fn position_for_wayland(window: &WebviewWindow, state: &State<AppState>) {
@@ -623,7 +594,8 @@ impl WindowController {
             return Some((pos.x as i32, pos.y as i32));
         }
 
-        {
+        #[cfg(target_os = "linux")]
+        if win11_clipboard_history_lib::session::is_x11() {
             if let Some(p) = Self::get_cursor_xdotool() {
                 return Some(p);
             }
@@ -635,6 +607,7 @@ impl WindowController {
         None
     }
 
+    #[cfg(target_os = "linux")]
     fn get_cursor_xdotool() -> Option<(i32, i32)> {
         let output = std::process::Command::new("xdotool")
             .args(["getmouselocation", "--shell"])
@@ -658,6 +631,7 @@ impl WindowController {
         x.zip(y)
     }
 
+    #[cfg(target_os = "linux")]
     fn get_cursor_x11() -> Option<(i32, i32)> {
         use x11rb::connection::Connection;
         use x11rb::protocol::xproto::ConnectionExt;
@@ -719,6 +693,7 @@ impl SettingsController {
 
 /// Native border resizing temporarily gives focus to the compositor. Register
 /// on GTK itself: these presses do not reliably reach the React webview.
+#[cfg(target_os = "linux")]
 fn install_resize_focus_guard(
     window: &WebviewWindow,
     resize_focus_loss: Arc<NativeWindowInteraction>,
@@ -729,6 +704,7 @@ fn install_resize_focus_guard(
     if let Ok(native_window) = window.gtk_window() {
         let interaction_on_hide = resize_focus_loss.clone();
         native_window.connect_hide(move |_| {
+            POPUP_ACTIVATION.invalidate();
             interaction_on_hide.reset();
         });
         // A normal button-press signal runs during bubbling and can be consumed
@@ -743,25 +719,32 @@ fn install_resize_focus_guard(
             let Some(native) = native_weak.upgrade() else {
                 return;
             };
-            if native.is_resizable() && !native.is_maximized() {
-                // Gesture coordinates are local to the native window, avoiding
-                // global screen-coordinate assumptions on Wayland.
-                let (width, height) = native.size();
-                let border = f64::from(native.scale_factor() * 5);
-                let within_window = x >= -border
-                    && y >= -border
-                    && x <= f64::from(width) + border
-                    && y <= f64::from(height) + border;
-                let on_border = x <= border
-                    || y <= border
-                    || x >= f64::from(width) - border
-                    || y >= f64::from(height) - border;
-                // The top grip is draggable from the React header. GTK moves
-                // the whole native window from this area, so it needs the same
-                // protection as a border resize.
-                let on_drag_handle = within_window && (0.0..=24.0).contains(&y);
-                let protect_focus_loss = within_window && (on_border || on_drag_handle);
-                resize_focus_loss.begin(protect_focus_loss);
+            // Gesture coordinates are local to the native window, avoiding
+            // global screen-coordinate assumptions on Wayland.
+            let (width, height) = native.size();
+            let border = f64::from(native.scale_factor() * 5);
+            let within_window = x >= -border
+                && y >= -border
+                && x <= f64::from(width) + border
+                && y <= f64::from(height) + border;
+            let on_border = x <= border
+                || y <= border
+                || x >= f64::from(width) - border
+                || y >= f64::from(height) - border;
+            // The top grip is draggable from the React header. GTK moves
+            // the whole native window from this area, so it needs the same
+            // protection as a border resize.
+            let on_drag_handle = within_window && (0.0..=24.0).contains(&y);
+            if within_window {
+                resize_focus_loss.begin_press(
+                    native.is_resizable(),
+                    native.is_maximized(),
+                    native.window().is_some_and(|window| {
+                        window.state().contains(gtk::gdk::WindowState::FULLSCREEN)
+                    }),
+                    on_border,
+                    on_drag_handle,
+                );
             }
         });
         let native_weak = native_window.downgrade();
@@ -1050,7 +1033,7 @@ fn main() {
             // This runs before anything else to prevent the window from appearing
             if start_in_background_clone {
                 if let Some(main_window) = app.get_webview_window("main") {
-                    let _ = main_window.hide();
+                    WindowController::hide(main_window.app_handle());
                     println!("[Setup] Immediately hiding main window for background mode");
                 }
             }
@@ -1127,6 +1110,7 @@ fn main() {
             let w_clone = main_window.clone();
             let focus_generation = Arc::new(AtomicU64::new(0));
             let resize_focus_loss = Arc::new(NativeWindowInteraction::default());
+            #[cfg(target_os = "linux")]
             install_resize_focus_guard(
                 &main_window,
                 resize_focus_loss.clone(),
@@ -1148,10 +1132,14 @@ fn main() {
                     // immediately hide the window
                     if started_in_background && !initial_show_allowed {
                         println!("[WindowController] Background mode: intercepted focus, hiding window");
-                        let _ = w_clone.hide();
+                        WindowController::hide(w_clone.app_handle());
                     }
                 }
                 WindowEvent::Focused(false) => {
+                    POPUP_ACTIVATION.invalidate();
+                    if cfg!(target_os = "linux") && is_wayland() {
+                        let _ = w_clone.set_always_on_top(false);
+                    }
                     let generation = focus_generation.fetch_add(1, Ordering::SeqCst) + 1;
                     // Retain the interaction marker: GTK may report focus loss
                     // before the captured press reaches this event handler.
@@ -1228,7 +1216,7 @@ fn main() {
                             match window_clone.is_visible() {
                                 Ok(true) => {
                                     println!("[Startup] Background enforcer #{}: window was visible, hiding again", i + 1);
-                                    let _ = window_clone.hide();
+                                    WindowController::hide(window_clone.app_handle());
                                 }
                                 Ok(false) => {} // Window exists but is hidden, nothing to do
                                 Err(_) => break, // Window was destroyed, stop the enforcer

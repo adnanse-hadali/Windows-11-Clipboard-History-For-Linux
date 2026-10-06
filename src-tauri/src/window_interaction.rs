@@ -10,6 +10,21 @@ pub(crate) struct NativeWindowInteraction {
 }
 
 impl NativeWindowInteraction {
+    pub(crate) fn begin_press(
+        &self,
+        resizable: bool,
+        maximized: bool,
+        fullscreen: bool,
+        on_border: bool,
+        on_drag_handle: bool,
+    ) {
+        // Every in-window press needs held-click protection, even when native
+        // resizing/moving is unavailable in this window state.
+        let native_operation =
+            !maximized && !fullscreen && ((resizable && on_border) || on_drag_handle);
+        self.begin(native_operation);
+    }
+
     pub(crate) fn begin(&self, protect: bool) {
         self.pointer_down.store(true, Ordering::SeqCst);
         self.phase.store(u8::from(protect), Ordering::SeqCst);
@@ -52,6 +67,22 @@ impl NativeWindowInteraction {
 #[cfg(test)]
 mod tests {
     use super::NativeWindowInteraction;
+
+    #[test]
+    fn held_clicks_survive_maximized_fullscreen_and_fixed_size_windows() {
+        for (resizable, maximized, fullscreen) in
+            [(true, true, false), (true, false, true), (false, false, false)]
+        {
+            let interaction = NativeWindowInteraction::default();
+            interaction.begin_press(resizable, maximized, fullscreen, true, false);
+            interaction.focus_gained();
+            assert!(interaction.focus_lost());
+            interaction.focus_gained();
+            assert!(interaction.is_protected());
+            interaction.release();
+            assert!(!interaction.focus_lost());
+        }
+    }
 
     #[test]
     fn recorded_resize_and_drag_sequences_preserve_protection() {
